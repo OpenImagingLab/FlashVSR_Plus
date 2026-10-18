@@ -1,3 +1,4 @@
+# Modified: optional resident-input inference and reduced frame-transfer/copy overhead.
 from __future__ import annotations
 
 from typing import Any
@@ -88,45 +89,38 @@ class TinyDecoder:
         candidates.append(("serial", False))
         return candidates
 
-    def _decode_chunks(
-        self,
-        latents: torch.Tensor,
-        lq_video: torch.Tensor,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        use_parallel: bool,
-        first: bool = True,
-    ) -> torch.Tensor:
-        # Decode in bounded temporal segments. The decoder still uses its
-        # internal four-latent temporal microsteps for correct memory updates.
-        latent_chunk_size = 4
-        outputs = []
-        for latent_start in range(0, latents.shape[2], latent_chunk_size):
-            latent_stop = min(latent_start + latent_chunk_size, latents.shape[2])
-            current_latents = latents[:, :, latent_start:latent_stop].to(
-                device=device, dtype=dtype
-            )
-            if first and latent_start == 0:
-                frame_start = 0
-                frame_count = 4 * (latent_stop - latent_start) - 3
-            else:
-                frame_start = 4 * latent_start - (3 if first else 0)
-                frame_count = 4 * (latent_stop - latent_start)
-            current_lq = lq_video[:, :, frame_start : frame_start + frame_count].to(
-                device=device, dtype=dtype
-            )
+    def _decode_chunks(self, latents, lq_video, *, device, dtype, use_parallel, first=True):
+        # Time-major backing storage matches decode_video's output. Each decoded
+        # chunk transfers directly into its final slice, avoiding a CPU cat/copy.
+        output = None
+        output_offset = 0
+        chunk = 4
+        for start in range(0, latents.shape[2], chunk):
+            stop = min(start + chunk, latents.shape[2])
+            current_latents = latents[:, :, start:stop].to(device=device, dtype=dtype, non_blocking=True)
+            frame_start = 0 if first and start == 0 else 4 * start - (3 if first else 0)
+            frame_count = 4 * (stop - start) - (3 if first and start == 0 else 0)
+            current_lq = lq_video[:, :, frame_start:frame_start + frame_count].to(device=device, dtype=dtype, non_blocking=True)
             current = self.module.decode_video(
-                current_latents.transpose(1, 2),
-                parallel=use_parallel,
-                show_progress_bar=False,
-                cond=current_lq,
+                current_latents.transpose(1, 2), parallel=use_parallel,
+                show_progress_bar=False, cond=current_lq,
             ).transpose(1, 2)
-            outputs.append(current.detach().to("cpu"))
+            current.mul_(2).sub_(1)
+            # Match the time-major CPU destination on CUDA. Otherwise a strided
+            # device-to-host copy may materialize/reorder its temporary on CPU.
+            current = current.transpose(1, 2).contiguous().transpose(1, 2)
+            if output is None:
+                batch, channels, _, height, width = current.shape
+                total = 4 * latents.shape[2] - (3 if first else 0)
+                output = torch.empty((batch, total, channels, height, width),
+                                     device='cpu', dtype=current.dtype).transpose(1, 2)
+            count = current.shape[2]
+            output[:, :, output_offset:output_offset + count].copy_(current.detach())
+            output_offset += count
             del current_latents, current_lq, current
-        value = torch.cat(outputs, dim=2)
-        outputs.clear()
-        return value
+        if output is None or output_offset != output.shape[2]:
+            raise RuntimeError('TinyDecoder emitted an unexpected number of frames')
+        return output
 
     @torch.inference_mode()
     def decode_stream_segment(self, latents, lq_video, *, first: bool = False):
@@ -165,7 +159,7 @@ class TinyDecoder:
             # No decoder activations remain on GPU while DiT resumes.
             self.module.mem = [None if x is None else x.detach().cpu().clone()
                                for x in self.module.mem]
-            return DecodeResult(value.mul_(2).sub_(1), None)
+            return DecodeResult(value, None)
         raise RuntimeError("Tiny Decoder produced no output")
 
     def decode(
@@ -195,7 +189,6 @@ class TinyDecoder:
         else:
             candidates = [("parallel", True)]
 
-        last_error = None
         self.last_auto_fallbacks = 0
         try:
             for mode, use_parallel in candidates:
@@ -209,19 +202,17 @@ class TinyDecoder:
                         use_parallel=use_parallel,
                     )
                 except torch.cuda.OutOfMemoryError as error:
-                    last_error = error
                     if requested_mode != "auto" or mode == "serial":
                         raise
+                    # Do not retain the failed chunk through its traceback.
+                    error.__traceback__ = None
                     self.last_auto_fallbacks += 1
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
                     continue
                 self.last_execution_mode = mode
                 # The original Tiny Decoder produces approximately [0,1].
-                value = value.mul(2).sub(1)
                 return DecodeResult(value, None)
-            if last_error is not None:
-                raise last_error
             raise RuntimeError("Tiny Decoder produced no output")
         finally:
             self.reset()

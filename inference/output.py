@@ -1,3 +1,4 @@
+# Modified: optional resident-input inference and reduced frame-transfer/copy overhead.
 """Inference output serialization helpers."""
 
 from __future__ import annotations
@@ -54,14 +55,20 @@ def tensor_to_uint8_frames(
 class IncrementalVideoWriter:
     """Append bounded CPU tensors to a single encoder session."""
 
-    def __init__(self, path, fps, *, preset="veryfast"):
+    def __init__(self, path, fps, *, preset="veryfast", output_size=None):
         self.destination = Path(path)
         self.destination.parent.mkdir(parents=True, exist_ok=True)
         self.fps = float(fps)
+        self.output_size = tuple(output_size) if output_size is not None else None
+        options = ["-preset", preset]
+        if self.output_size is not None:
+            if len(self.output_size) != 2 or any(type(x) is not int or x <= 0 or x % 2 for x in self.output_size):
+                raise ValueError("output_size must contain positive even width and height")
+            options += ["-vf", f"scale={self.output_size[0]}:{self.output_size[1]}:flags=lanczos"]
         self.writer = imageio.get_writer(
             str(self.destination), format="FFMPEG", mode="I", fps=self.fps,
             codec="libx264", pixelformat="yuv420p", macro_block_size=None,
-            output_params=["-preset", preset],
+            output_params=options,
         )
         self.frame_count = 0
         self.first_frame = None
@@ -77,6 +84,17 @@ class IncrementalVideoWriter:
             self.writer.append_data(frame)
             self.frame_count += 1
 
+    def append_rgb8(self, frames: np.ndarray):
+        """Append already-quantized [F,H,W,3] CPU frames without float copies."""
+        if (not isinstance(frames, np.ndarray) or frames.dtype != np.uint8
+                or frames.ndim != 4 or frames.shape[-1] != 3):
+            raise ValueError("Expected [F,H,W,3] uint8 RGB frames")
+        for frame in frames:
+            if self.first_frame is None:
+                self.first_frame = frame.copy()
+            self.writer.append_data(frame)
+            self.frame_count += 1
+
     def close(self):
         self.writer.close()
 
@@ -85,6 +103,10 @@ class IncrementalVideoWriter:
         frame_count, first_frame = self.frame_count, self.first_frame
         if first_frame is None:
             raise RuntimeError("No frames were written")
+        if self.output_size is not None:
+            # The encoder performs the actual resize; this only verifies that
+            # its first decoded picture has the expected size and colour.
+            first_frame = cv2.resize(first_frame, self.output_size, interpolation=cv2.INTER_LANCZOS4)
         height, width = first_frame.shape[:2]
         capture = cv2.VideoCapture(str(destination))
         ok, decoded_bgr = capture.read()

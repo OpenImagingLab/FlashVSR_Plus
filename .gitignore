@@ -5,6 +5,7 @@ __pycache__/
 ckpts/*
 !ckpts/.gitkeep
 outputs/
-tests/
+tests/*
+!tests/test_fast_buffers.py
 operators/Block-Sparse-Attention
 *.egg-info

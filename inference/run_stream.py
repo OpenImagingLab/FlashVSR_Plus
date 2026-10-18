@@ -1,3 +1,4 @@
+# Modified: optional resident-input inference and reduced frame-transfer/copy overhead.
 from __future__ import annotations
 
 import argparse
@@ -133,7 +134,28 @@ def parse_args() -> argparse.Namespace:
         default="veryfast",
         help="x264 encoding preset for output video speed/size tradeoff",
     )
-    return parser.parse_args()
+    parser.add_argument("--fast-buffers", action="store_true",
+                        help="opt in to resident TC4 BF16 input and bounded CUDA colour/RGB8 output")
+    parser.add_argument("--tensor-resize", action="store_true",
+                        help="opt-in two-pass CUDA bicubic approximation to PIL; requires --fast-buffers")
+    parser.add_argument("--triton-wavelet", action="store_true",
+                        help="use checked FP32 Triton wavelet blur; requires --fast-buffers")
+    parser.add_argument("--resident-budget-gib", type=float, default=5.0,
+                        help="maximum resident input allocation; excludes models, KV and workspaces")
+    parser.add_argument("--cache-offload-layers", type=int, nargs="+", default=None,
+                        help="explicit exact KV layers to keep in RAM, e.g. 0 through 11 for benchmark Base")
+    parser.add_argument("--delivery-size", type=int, nargs=2, metavar=("HEIGHT", "WIDTH"),
+                        help="optional final CPU encoder size; model canvas remains unchanged")
+    parser.add_argument("--timings-json", default=None,
+                        help="save fast-path stage timings and metadata as JSON")
+    args = parser.parse_args()
+    if (args.tensor_resize or args.triton_wavelet or args.timings_json or args.delivery_size) and not args.fast_buffers:
+        parser.error("--tensor-resize, --triton-wavelet, --delivery-size and --timings-json require --fast-buffers")
+    if args.cache_offload_layers is not None and any(x < 0 or x >= 30 for x in args.cache_offload_layers):
+        parser.error("--cache-offload-layers must be between 0 and 29")
+    if args.cache_offload_layers and args.cache_offload_mode == "never":
+        parser.error("explicit offload layers conflict with --cache-offload-mode never")
+    return args
 
 
 def main() -> None:
@@ -163,6 +185,11 @@ def main() -> None:
         color_correction_levels=args.color_correction_levels,
         color_correction_chunk_size=args.color_correction_chunk_size,
     )
+    if args.cache_offload_layers is not None:
+        config.stream_cache_offload_layers = tuple(args.cache_offload_layers)
+    if args.fast_buffers and (config.temporal_compression != 4
+                             or config.decoder.decode_every != "auto"):
+        raise ValueError("--fast-buffers requires TC4 and --decode-every auto")
     paths = model_paths_for_mode(root, args.mode, args.ckpt_dir)
 
     if not torch.cuda.is_available():
@@ -187,7 +214,16 @@ def main() -> None:
     )
     torch.cuda.reset_peak_memory_stats(device)
     print_stage("Running inference...")
-    result = pipeline.infer(
+    infer = pipeline.infer
+    extra = {}
+    if args.fast_buffers:
+        from inference.fast import infer_fast
+        infer = lambda request, **kwargs: infer_fast(pipeline, request, **kwargs)
+        extra = dict(tensor_resize=args.tensor_resize,
+                     triton_wavelet=args.triton_wavelet,
+                     resident_budget_gib=args.resident_budget_gib,
+                     delivery_size=tuple(reversed(args.delivery_size)) if args.delivery_size else None)
+    result = infer(
         InferenceRequest(
             input_path=args.input,
             output_path=output,
@@ -197,7 +233,13 @@ def main() -> None:
         ),
         progress=lambda message: print_stage(message, done=True),
         video_preset=args.video_preset,
+        **extra,
     )
+    if args.timings_json:
+        import json
+        timings_path = Path(args.timings_json).expanduser()
+        timings_path.parent.mkdir(parents=True, exist_ok=True)
+        timings_path.write_text(json.dumps(result.metadata, indent=2) + "\n")
     print_stage("Inference complete", done=True)
     torch.cuda.synchronize(device)
     print_stage(f"Saved to {result.output_path}", done=True)
