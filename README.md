@@ -52,6 +52,17 @@ We release the inference code, pretrained models, and training dataset to facili
 - **Long-video option:** a numeric `--decode-every` reads and writes video in segments; the default `auto` mode loads the full input.
 - **Attention backends:** use Block Sparse Attention, the included Triton operator, or PyTorch SDPA.
 
+## Third-Party Integrations
+
+We appreciate the community's efforts to extend and optimize FlashVSR+:
+
+- **[fal.ai](https://fal.ai/models/openimaginglab/flashvsr-plus)** — Online inference API.
+- **[FlashVSR+ ComfyUI](https://huggingface.co/t8star/Flashvsr-Plus-Comfy)** — Community ComfyUI integration.
+- **[FlashVSRPlusTiledUpscaleVideo](https://comfy.icu/node/FlashVSRPlusTiledUpscaleVideo)** — ComfyUI video upscaling node.
+- **[RTX 5090 Performance Optimization](https://github.com/OpenImagingLab/FlashVSR_Plus/pull/3)** — Community-contributed inference optimizations by [5andr0](https://github.com/5andr0), reducing CPU transfers and improving buffer management.
+
+**Disclaimer:** These community contributions have not been officially tested or verified by our team. We sincerely thank all contributors for their valuable work!
+
 ## Requirements
 
 - Linux
