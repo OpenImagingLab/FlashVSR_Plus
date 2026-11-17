@@ -1,3 +1,4 @@
+# Modified: optional resident-input inference and reduced frame-transfer/copy overhead.
 from __future__ import annotations
 
 import torch
@@ -26,21 +27,27 @@ def _wavelet_blur(value: torch.Tensor, radius: int) -> torch.Tensor:
     )
 
 
-def _wavelet_low_frequency(value: torch.Tensor, levels: int) -> torch.Tensor:
+def _wavelet_low_frequency(value: torch.Tensor, levels: int, blur=_wavelet_blur) -> torch.Tensor:
     low = value
     for level in range(levels):
-        low = _wavelet_blur(low, 2**level)
+        low = blur(low, 2**level)
     return low
 
 
 class WaveletColorCorrector:
     """Match generated low-frequency color to LQ while retaining output detail."""
 
-    def __init__(self, *, levels: int = 5, chunk_size: int = 16):
+    def __init__(self, *, levels: int = 5, chunk_size: int = 16, backend: str = "torch"):
         if levels <= 0:
             raise ValueError("levels must be positive")
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
+        if backend not in {"torch", "triton"}:
+            raise ValueError("wavelet backend must be torch or triton")
+        self.blur = _wavelet_blur
+        if backend == "triton":
+            from .wavelet_cuda import wavelet_blur
+            self.blur = wavelet_blur
         self.levels = levels
         self.chunk_size = chunk_size
 
@@ -69,8 +76,8 @@ class WaveletColorCorrector:
                 -1, 3, *generated.shape[-2:]
             )
 
-            content_low = _wavelet_low_frequency(content, self.levels)
-            style_low = _wavelet_low_frequency(style, self.levels)
+            content_low = _wavelet_low_frequency(content, self.levels, self.blur)
+            style_low = _wavelet_low_frequency(style, self.levels, self.blur)
             corrected = (content - content_low + style_low).clamp_(-1.0, 1.0)
             corrected = corrected.reshape(
                 generated.shape[0], stop - start, 3, *generated.shape[-2:]
